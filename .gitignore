@@ -1,0 +1,13 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+# Write all the names of files that do not need to be tracked by Git in this project.
+assignment-03.pdf
+.venv/
+src/
+.env
+
