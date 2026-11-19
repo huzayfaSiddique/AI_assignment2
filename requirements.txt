@@ -1,3 +1,4 @@
+fastmcp
 langchain
 langchain-groq
 langchain-openai

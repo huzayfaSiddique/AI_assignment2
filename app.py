@@ -1,11 +1,26 @@
+import asyncio
 import streamlit as st
 from langchain.messages import AIMessage, HumanMessage
 
-from agent import agent, chat
+from agent import chat, get_agent
 from tools import save_report
 
 st.set_page_config(page_title="PUCIT GPA/CGPA Agent", page_icon="🎓")
 st.title("PUCIT (COMPUTER SCIENCE) GPA/CGPA Agent")
+
+# Initialize agent connected to MCP server
+if "agent" not in st.session_state:
+    try:
+        with st.spinner("Connecting to MCP server..."):
+            st.session_state.agent = asyncio.run(get_agent())
+    except Exception as exc:
+        st.error(
+            f"Could not connect to MCP server: {exc}\n\n"
+            "Please ensure the FastMCP server is running: `python server/server.py`"
+        )
+        st.stop()
+
+agent = st.session_state.agent
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -27,10 +42,11 @@ if prompt := st.chat_input("e.g. I'm in semester 5 with a CGPA of 3.0 - what do 
     with st.chat_message("assistant"):
         with st.spinner("Working it out..."):
             try:
-                st.session_state.messages, reply = chat(
-                    agent, st.session_state.messages, prompt)
+                st.session_state.messages, reply = asyncio.run(
+                    chat(agent, st.session_state.messages, prompt)
+                )
                 st.markdown(reply)
-            except Exception as exc:  
+            except Exception as exc:
                 st.error(f"Could not complete that turn: {exc}")
 
 with st.sidebar:
@@ -64,4 +80,3 @@ with st.sidebar:
             "- I want to graduate with a 3.5. What do I need from here?\n"
             "- What courses are in semester 6?"
         )
-

@@ -1,6 +1,10 @@
+import asyncio
+import os
 import sys
 
+from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain.mcp import MCPAdapter
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
@@ -15,7 +19,12 @@ from tools import (
     save_report,
 )
 
-TOOLS = [
+load_dotenv()
+
+MCP_URL = os.getenv("MCP_URL", "http://127.0.0.1:8000/mcp")
+FASTMCP_KEY = os.getenv("FASTMCP_KEY")
+
+LOCAL_TOOLS = [
     marks_to_grade_points,
     calculate_semester_gpa,
     calculate_new_cgpa,
@@ -86,24 +95,43 @@ about 3.86, which is achievable. The sooner you start, the lower the number gets
 
 Style: be concise and conversational.
 • Never output LaTeX, raw mathematical formulas, or equation derivations (such as
-  \frac, \approx, or [ \text{...} ]).
+  \\frac, \\approx, or [ \\text{...} ]).
 • Round numbers to 2 decimal places and explain your reasoning in natural plain text
   rather than displaying formulas or dumping tool syntax."""
 
 
-def create_agent(tools=None, system_prompt=None, checkpointer=None):
-    """Build the StateGraph agent from the model, tools, and system prompt."""
-    selected_tools = tools if tools is not None else TOOLS
+async def get_mcp_tools(mcp_url: str | None = None, auth_key: str | None = None) -> list:
+    """Connect to the FastMCP server and return LangChain tools."""
+    url = mcp_url or os.getenv("MCP_URL", "http://127.0.0.1:8000/mcp")
+    key = auth_key or os.getenv("FASTMCP_KEY")
+    print(f"[AGENT] Fetching tools from MCP server at {url}...")
+
+    if key:
+        from fastmcp.client import Client
+        target = Client(url, auth=key)
+    else:
+        target = url
+
+    adapter = MCPAdapter(target)
+    tools = await adapter.list_tools()
+    tool_names = [getattr(t, "name", str(t)) for t in tools]
+    print(f"[AGENT] Connected to MCP server. Loaded {len(tools)} tools: {tool_names}")
+    return tools
+
+
+def create_agent(tools: list | None = None, system_prompt: str | None = None, checkpointer=None):
+    """Build the async StateGraph agent from the model, tools, and system prompt."""
+    selected_tools = tools if tools is not None else LOCAL_TOOLS
     prompt = system_prompt if system_prompt is not None else SYSTEM_PROMPT
 
     print(f"[AGENT] Initialising agent graph with {len(selected_tools)} tools...")
     llm_with_tools = llm.bind_tools(selected_tools)
 
-    def call_model(state: MessagesState):
+    async def call_model(state: MessagesState):
         messages = state["messages"]
         if not messages or not isinstance(messages[0], SystemMessage):
             messages = [SystemMessage(content=prompt)] + list(messages)
-        response = llm_with_tools.invoke(messages)
+        response = await llm_with_tools.ainvoke(messages)
         return {"messages": [response]}
 
     workflow = StateGraph(MessagesState)
@@ -121,20 +149,22 @@ def create_agent(tools=None, system_prompt=None, checkpointer=None):
     return ag
 
 
-agent = create_agent()
+async def get_agent(mcp_url: str | None = None, auth_key: str | None = None, checkpointer=None):
+    """Connect to MCP server, discover tools, and return a compiled agent graph."""
+    tools = await get_mcp_tools(mcp_url=mcp_url, auth_key=auth_key)
+    return create_agent(tools=tools, checkpointer=checkpointer)
 
 
-def chat(agent, messages, user_input: str, attempts: int = 3):
+agent = None  # Populated when running or via get_agent()
+
+
+async def chat(agent, messages, user_input: str, attempts: int = 3, config: dict | None = None):
     """
-    Run one conversation turn and return (messages, reply).
+    Run one conversation turn asynchronously and return (messages, reply).
 
     The model is stateless, so the caller carries the history: pass in the whole
     `messages` list plus the new user input, and feed the returned list into the
-    next call. This is the only thing that makes a conversation work.
-
-    Groq occasionally rejects a tool call that the model has malformed (for
-    example an empty argument list). That is a provider glitch rather than a
-    problem with the conversation, so a turn is retried before giving up.
+    next call.
     """
     turn = len(messages) + 1
     print(f"\n[AGENT] Turn {turn} | User: {user_input[:120]}")
@@ -142,27 +172,37 @@ def chat(agent, messages, user_input: str, attempts: int = 3):
     for attempt in range(1, attempts + 1):
         try:
             print(f"[AGENT] Invoking agent (attempt {attempt}/{attempts})...")
-            result = agent.invoke({"messages": messages})
+            result = await agent.ainvoke({"messages": messages}, config=config)
             last_msg = result["messages"][-1]
             reply = getattr(last_msg, "text", None) or getattr(last_msg, "content", "")
             print(f"[AGENT] Reply: {reply[:120]}")
             return result["messages"], reply
-        except Exception as exc:  
+        except Exception as exc:
             print(f"[WARN]  Attempt {attempt}/{attempts} failed: {exc}")
             if attempt == attempts:
                 raise
 
 
-def main() -> None:
-    """Terminal chat loop that keeps the conversation history across turns."""
+async def main() -> None:
+    """Terminal chat loop connecting to the MCP server."""
+    global agent
 
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except (AttributeError, OSError):
         pass
+
     print("[AGENT] Session started.")
+    try:
+        agent = await get_agent()
+    except Exception as exc:
+        print(f"\n[ERROR] Failed to connect to MCP server: {exc}")
+        print(f"Make sure your MCP server is running at {os.getenv('MCP_URL', 'http://127.0.0.1:8000/mcp')}")
+        print("To start the MCP server, run: python server/server.py\n")
+        return
+
     messages = []
-    print("PUCIT GPA/CGPA agent. Ask a question, or type 'quit' to exit.\n")
+    print("PUCIT GPA/CGPA agent (MCP connected). Ask a question, or type 'quit' to exit.\n")
     while True:
         try:
             user_input = input("You: ")
@@ -174,7 +214,7 @@ def main() -> None:
         if not user_input.strip():
             continue
         try:
-            messages, reply = chat(agent, messages, user_input)
+            messages, reply = await chat(agent, messages, user_input)
         except Exception as exc:  # noqa: BLE001
             print(f"[ERROR] Turn failed: {exc}\n")
             continue
@@ -183,4 +223,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
