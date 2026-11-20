@@ -18,9 +18,15 @@ if not OMNIROUTE_API_KEY:
         "OMNIROUTE_API_KEY is not set. Please set OMNIROUTE_API_KEY in your .env file."
     )
 
-llm = ChatOpenAI(
-    model=MODEL_NAME,
-    base_url=OMNIROUTE_BASE_URL,
-    api_key=OMNIROUTE_API_KEY,
-    temperature=0,
-)
+
+def get_llm():
+    """Return a fresh ChatOpenAI client bound to the current event loop."""
+    return ChatOpenAI(
+        model=MODEL_NAME,
+        base_url=OMNIROUTE_BASE_URL,
+        api_key=OMNIROUTE_API_KEY,
+        temperature=0,
+    )
+
+
+llm = get_llm()

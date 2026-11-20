@@ -1,7 +1,9 @@
+aiosqlite
 fastmcp
 langchain
 langchain-groq
 langchain-openai
+langgraph-checkpoint-sqlite
 python-dotenv
 streamlit
 

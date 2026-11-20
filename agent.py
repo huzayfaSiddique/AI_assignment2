@@ -3,12 +3,13 @@ import os
 import sys
 
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage
 from langchain.mcp import MCPAdapter
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
-from llm import llm
+from llm import get_llm, llm
 from tools import (
     calculate_new_cgpa,
     calculate_semester_gpa,
@@ -23,6 +24,7 @@ load_dotenv()
 
 MCP_URL = os.getenv("MCP_URL", "http://127.0.0.1:8000/mcp")
 FASTMCP_KEY = os.getenv("FASTMCP_KEY")
+DB_PATH = os.getenv("DB_PATH", "chats.sqlite")
 
 LOCAL_TOOLS = [
     marks_to_grade_points,
@@ -119,25 +121,40 @@ async def get_mcp_tools(mcp_url: str | None = None, auth_key: str | None = None)
     return tools
 
 
-def create_agent(tools: list | None = None, system_prompt: str | None = None, checkpointer=None):
-    """Build the async StateGraph agent from the model, tools, and system prompt."""
+def create_agent(tools: list | None = None, system_prompt: str | None = None, checkpointer=None, model=None):
+    """Build the async StateGraph agent from the model, tools, and checkpointer."""
     selected_tools = tools if tools is not None else LOCAL_TOOLS
     prompt = system_prompt if system_prompt is not None else SYSTEM_PROMPT
+    active_llm = model if model is not None else get_llm()
 
     print(f"[AGENT] Initialising agent graph with {len(selected_tools)} tools...")
-    llm_with_tools = llm.bind_tools(selected_tools)
+    llm_with_tools = active_llm.bind_tools(selected_tools)
 
-    async def call_model(state: MessagesState):
+    async def call_model(state: MessagesState, config=None):
+        thread_id = (config or {}).get("configurable", {}).get("thread_id")
+        student_ctx = (
+            f"\n\n[STUDENT IDENTITY]\nThe student chatting with you is named: {thread_id}. "
+            f"If they ask who they are or what their name is, tell them directly that their name is {thread_id}."
+            if thread_id
+            else ""
+        )
         messages = state["messages"]
         if not messages or not isinstance(messages[0], SystemMessage):
-            messages = [SystemMessage(content=prompt)] + list(messages)
+            full_system_prompt = f"{student_ctx}\n\n{prompt}" if student_ctx else prompt
+            messages = [SystemMessage(content=full_system_prompt)] + list(messages)
         response = await llm_with_tools.ainvoke(messages)
         return {"messages": [response]}
+
+    # Handle errors gracefully if MCP server goes down mid-call (Task 6)
+    def handle_tool_error(exc: Exception) -> str:
+        return f"Error: Tool execution failed ({exc}). The MCP server might be offline or unreachable."
+
+    tool_node = ToolNode(selected_tools, handle_tool_errors=handle_tool_error)
 
     workflow = StateGraph(MessagesState)
 
     workflow.add_node("agent", call_model)
-    workflow.add_node("tools", ToolNode(selected_tools))
+    workflow.add_node("tools", tool_node)
 
     workflow.add_edge(START, "agent")
     workflow.add_conditional_edges("agent", tools_condition)
@@ -149,42 +166,180 @@ def create_agent(tools: list | None = None, system_prompt: str | None = None, ch
     return ag
 
 
+async def heal_dangling_tool_calls(app, config: dict) -> None:
+    """
+    Check if the conversation ended with an unfulfilled tool call (e.g. if the MCP
+    server crashed or network dropped mid-call). If so, inject a synthetic ToolMessage
+    so the model API never rejects the history. (Task 6)
+    """
+    try:
+        state = await app.aget_state(config)
+        if not state or not state.values or "messages" not in state.values:
+            return
+
+        messages = state.values["messages"]
+        if not messages:
+            return
+
+        last_msg = messages[-1]
+        tool_calls = getattr(last_msg, "tool_calls", None)
+        if isinstance(last_msg, AIMessage) and tool_calls:
+            # Check which tool_calls were not answered
+            heals = []
+            for tc in tool_calls:
+                call_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                if call_id:
+                    heals.append(
+                        ToolMessage(
+                            content="Error: Tool call could not be completed because the MCP server was offline.",
+                            tool_call_id=call_id,
+                        )
+                    )
+            if heals:
+                print(f"[RECOVERY] Healing {len(heals)} unanswered tool call(s) from previous interrupted run...")
+                await app.aupdate_state(config, {"messages": heals})
+    except Exception as exc:
+        print(f"[WARN] Failed to check/heal dangling tool calls: {exc}")
+
+
+async def list_threads(memory: AsyncSqliteSaver) -> list[str]:
+    """Print and return the saved thread IDs (student names) from the checkpointer."""
+    threads = set()
+    try:
+        async for checkpoint_tuple in memory.alist(None):
+            thread_id = checkpoint_tuple.config.get("configurable", {}).get("thread_id")
+            if thread_id:
+                threads.add(thread_id)
+    except Exception as exc:
+        print(f"[WARN] Could not retrieve saved threads: {exc}")
+
+    thread_list = sorted(threads)
+    if thread_list:
+        print(f"\n[MEMORY] Saved chats: {', '.join(thread_list)}")
+    else:
+        print("\n[MEMORY] No saved chats found.")
+    return thread_list
+
+
+async def show_history(app, config: dict) -> list:
+    """Print and return the saved conversation history for the current thread."""
+    thread_id = config.get("configurable", {}).get("thread_id", "unknown")
+    try:
+        state = await app.aget_state(config)
+    except Exception as exc:
+        print(f"\n[ERROR] Failed to load history for '{thread_id}': {exc}\n")
+        return []
+
+    messages = state.values.get("messages", []) if state else []
+    if not messages:
+        print(f"\n[HISTORY] No saved messages found for '{thread_id}'.\n")
+        return []
+
+    print(f"\n--- History for '{thread_id}' ({len(messages)} messages) ---")
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            role = "You"
+        elif isinstance(msg, AIMessage):
+            role = "Agent"
+        else:
+            continue
+        content = getattr(msg, "text", None) or getattr(msg, "content", "")
+        if content:
+            print(f"[{role}] {content}")
+    print("--------------------------------------------------\n")
+    return messages
+
+
+async def chat_stream(app, user_input: str, config: dict) -> str:
+    """
+    Stream agent response tokens and updates in real-time using app.astream.
+    Returns the accumulated final response text.
+    """
+    inputs = {"messages": [HumanMessage(content=user_input)]}
+    full_reply = ""
+    print("\nAgent: ", end="", flush=True)
+
+    try:
+        async for chunk in app.astream(
+            inputs,
+            config=config,
+            stream_mode=["updates", "messages"],
+            version="v2",
+        ):
+            if chunk["type"] == "messages":
+                token, metadata = chunk["data"]
+                node = metadata.get("langgraph_node")
+                # Stream agent tokens as they are generated
+                if node == "agent":
+                    content = getattr(token, "content", "")
+                    if isinstance(content, str) and content:
+                        print(content, end="", flush=True)
+                        full_reply += content
+                    elif isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                text = item.get("text", "")
+                                print(text, end="", flush=True)
+                                full_reply += text
+            elif chunk["type"] == "updates":
+                for node, update in chunk["data"].items():
+                    if node == "tools":
+                        # Optional: brief indication when tool finishes
+                        for tmsg in update.get("messages", []):
+                            t_name = getattr(tmsg, "name", "tool")
+                            print(f"\n[TOOL CALLED: {t_name}]", end="\nAgent: ", flush=True)
+    except Exception as exc:
+        print(f"\n[ERROR] Streaming failed: {exc}")
+        raise
+
+    print()  # Newline after stream finishes
+    return full_reply
+
+
+async def chat(agent, *args, config: dict | None = None, attempts: int = 3, **kwargs):
+    """
+    Flexible chat runner supporting both thread config (Task 3) and legacy callers.
+    If called with (agent, user_input, config=...): runs astream/ainvoke with checkpointer.
+    If called with (agent, messages, user_input): runs legacy list-based history.
+    """
+    # Case 1: chat(agent, user_input, config=config)
+    if len(args) == 1 and isinstance(args[0], str):
+        user_input = args[0]
+        cfg = config or kwargs.get("config", {"configurable": {"thread_id": "default"}})
+        return await chat_stream(agent, user_input, config=cfg)
+
+    # Case 2: chat(agent, user_input, config_dict)
+    if len(args) == 2 and isinstance(args[0], str) and isinstance(args[1], dict):
+        user_input, cfg = args[0], args[1]
+        return await chat_stream(agent, user_input, config=cfg)
+
+    # Case 3: chat(agent, messages_list, user_input_str) (Legacy support for app.py)
+    if len(args) >= 2 and isinstance(args[0], list) and isinstance(args[1], str):
+        messages, user_input = args[0], args[1]
+        cfg = config or kwargs.get("config")
+        messages = messages + [HumanMessage(user_input)]
+        result = await agent.ainvoke({"messages": messages}, config=cfg)
+        last_msg = result["messages"][-1]
+        reply = getattr(last_msg, "text", None) or getattr(last_msg, "content", "")
+        return result["messages"], reply
+
+    raise ValueError("Invalid arguments passed to chat().")
+
+
 async def get_agent(mcp_url: str | None = None, auth_key: str | None = None, checkpointer=None):
     """Connect to MCP server, discover tools, and return a compiled agent graph."""
     tools = await get_mcp_tools(mcp_url=mcp_url, auth_key=auth_key)
     return create_agent(tools=tools, checkpointer=checkpointer)
 
 
-agent = None  # Populated when running or via get_agent()
-
-
-async def chat(agent, messages, user_input: str, attempts: int = 3, config: dict | None = None):
-    """
-    Run one conversation turn asynchronously and return (messages, reply).
-
-    The model is stateless, so the caller carries the history: pass in the whole
-    `messages` list plus the new user input, and feed the returned list into the
-    next call.
-    """
-    turn = len(messages) + 1
-    print(f"\n[AGENT] Turn {turn} | User: {user_input[:120]}")
-    messages = messages + [HumanMessage(user_input)]
-    for attempt in range(1, attempts + 1):
-        try:
-            print(f"[AGENT] Invoking agent (attempt {attempt}/{attempts})...")
-            result = await agent.ainvoke({"messages": messages}, config=config)
-            last_msg = result["messages"][-1]
-            reply = getattr(last_msg, "text", None) or getattr(last_msg, "content", "")
-            print(f"[AGENT] Reply: {reply[:120]}")
-            return result["messages"], reply
-        except Exception as exc:
-            print(f"[WARN]  Attempt {attempt}/{attempts} failed: {exc}")
-            if attempt == attempts:
-                raise
+agent = None  # Global agent reference
 
 
 async def main() -> None:
-    """Terminal chat loop connecting to the MCP server."""
+    """
+    Terminal chat loop with SQLite memory (Task 3), MCP server tools (Task 2),
+    and streaming token responses (Task 4).
+    """
     global agent
 
     try:
@@ -193,33 +348,83 @@ async def main() -> None:
         pass
 
     print("[AGENT] Session started.")
+
+    # Task 2: Connect to MCP server
     try:
-        agent = await get_agent()
+        tools = await get_mcp_tools()
     except Exception as exc:
         print(f"\n[ERROR] Failed to connect to MCP server: {exc}")
         print(f"Make sure your MCP server is running at {os.getenv('MCP_URL', 'http://127.0.0.1:8000/mcp')}")
         print("To start the MCP server, run: python server/server.py\n")
         return
 
-    messages = []
-    print("PUCIT GPA/CGPA agent (MCP connected). Ask a question, or type 'quit' to exit.\n")
-    while True:
-        try:
-            user_input = input("You: ")
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-        if user_input.strip().lower() in {"quit", "exit"}:
-            break
-        if not user_input.strip():
-            continue
-        try:
-            messages, reply = await chat(agent, messages, user_input)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[ERROR] Turn failed: {exc}\n")
-            continue
-        print(f"Agent: {reply}\n")
-    print(f"[AGENT] Session ended. Total turns: {len(messages) // 2}")
+    # Task 3: Setup Async SQLite checkpointer
+    print(f"[AGENT] Initialising persistent SQLite memory ({DB_PATH})...")
+    async with AsyncSqliteSaver.from_conn_string(DB_PATH) as memory:
+        await memory.setup()
+
+        # Build graph with checkpointer
+        agent = create_agent(tools=tools, checkpointer=memory)
+
+        # 1. Print the saved chats with await list_threads(memory), then ask who is chatting
+        await list_threads(memory)
+        name = input("\nWho is chatting? ").strip()
+        while not name:
+            name = input("Please enter your name: ").strip()
+
+        config = {"configurable": {"thread_id": name}}
+        await heal_dangling_tool_calls(agent, config)
+
+        print(f"\nWelcome, {name}! PUCIT GPA Guider is ready.")
+        print("Special commands: /switch, /history, /forget, quit\n")
+
+        # 2. Main interactive chat loop
+        while True:
+            try:
+                user_input = input("You: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+
+            if not user_input:
+                continue
+
+            # Command: quit / exit
+            if user_input.lower() in {"quit", "exit"}:
+                break
+
+            # Command: /switch (change person)
+            if user_input.lower() == "/switch":
+                print("\n[SWITCH] Switching student...")
+                await list_threads(memory)
+                new_name = input("\nWho is chatting now? ").strip()
+                while not new_name:
+                    new_name = input("Please enter your name: ").strip()
+                name = new_name
+                config = {"configurable": {"thread_id": name}}
+                await heal_dangling_tool_calls(agent, config)
+                print(f"Switched to thread '{name}'.\n")
+                continue
+
+            # Command: /history (await show_history(app, config))
+            if user_input.lower() == "/history":
+                await show_history(agent, config)
+                continue
+
+            # Command: /forget (await memory.adelete_thread(name))
+            if user_input.lower() == "/forget":
+                await memory.adelete_thread(name)
+                print(f"[MEMORY] Deleted conversation history for '{name}'.\n")
+                continue
+
+            # Normal turn: send message with live streaming (Task 4)
+            try:
+                await chat_stream(agent, user_input, config=config)
+                print()
+            except Exception as exc:
+                print(f"\n[ERROR] Turn failed: {exc}\n")
+
+    print(f"[AGENT] Session ended.")
 
 
 if __name__ == "__main__":
