@@ -8,9 +8,9 @@ An intelligent, stateful GPA & CGPA assistant for PUCIT Computer Science student
 
 - **Student Name:** Huzayfa Siddique
 - **Roll Number:** BCSF24M049
-- **Live Hosted MCP Server URL:** `https://your-server.onrender.com/mcp` *(Replace with your deployed URL)*
-- **MCP Server API Key:** *(None / or add your key if authentication is enabled)*
-- **GitHub Repository (Server Code):** `https://github.com/your-username/pucit-gpa-mcp-server`
+- **Live Hosted MCP Server URL:** `https://ai-assignment2-hc2f.onrender.com/mcp`
+- **MCP Server API Key:** None (public endpoint)
+- **GitHub Repository (Server Code):** `https://github.com/huzayfaSiddique/AI_assignment2`
 
 ---
 
