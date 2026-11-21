@@ -302,23 +302,49 @@ else:
         st.session_state.messages.append(HumanMessage(content=prompt))
 
         with st.chat_message("assistant"):
-            with st.spinner("Working it out..."):
-                try:
-                    async def _run_turn():
-                        async with AsyncSqliteSaver.from_conn_string(DB_PATH) as memory:
-                            await memory.setup()
-                            tools = await get_mcp_tools()
-                            app = create_agent(tools=tools, checkpointer=memory)
-                            await heal_dangling_tool_calls(app, config)
-                            result = await app.ainvoke(
-                                {"messages": [HumanMessage(content=prompt)]},
-                                config=config,
-                            )
-                            last_msg = result["messages"][-1]
-                            return getattr(last_msg, "text", None) or getattr(last_msg, "content", "")
+            placeholder = st.empty()
+            placeholder.markdown("*(Thinking...)*")
 
-                    reply = run_async(_run_turn())
-                    st.session_state.messages.append(AIMessage(content=reply))
-                    st.markdown(reply)
-                except Exception as exc:
-                    st.error(f"Could not complete that turn: {exc}")
+            try:
+                async def _run_stream():
+                    async with AsyncSqliteSaver.from_conn_string(DB_PATH) as memory:
+                        await memory.setup()
+                        tools = await get_mcp_tools()
+                        agent_app = create_agent(tools=tools, checkpointer=memory)
+                        await heal_dangling_tool_calls(agent_app, config)
+
+                        full_reply = ""
+                        async for chunk in agent_app.astream(
+                            {"messages": [HumanMessage(content=prompt)]},
+                            config=config,
+                            stream_mode=["updates", "messages"],
+                            version="v2",
+                        ):
+                            if chunk["type"] == "messages":
+                                token, metadata = chunk["data"]
+                                node = metadata.get("langgraph_node")
+                                if node == "agent":
+                                    content = getattr(token, "content", "")
+                                    if isinstance(content, str) and content:
+                                        full_reply += content
+                                        placeholder.markdown(full_reply + "▌")
+                                    elif isinstance(content, list):
+                                        for item in content:
+                                            if isinstance(item, dict) and item.get("type") == "text":
+                                                full_reply += item.get("text", "")
+                                                placeholder.markdown(full_reply + "▌")
+                            elif chunk["type"] == "updates":
+                                for node, update in chunk["data"].items():
+                                    if node == "tools":
+                                        for tmsg in update.get("messages", []):
+                                            t_name = getattr(tmsg, "name", "GPA tool")
+                                            placeholder.markdown(f"⚙️ *Calculating with `{t_name}`...*\n\n")
+
+                        placeholder.markdown(full_reply)
+                        return full_reply
+
+                reply = run_async(_run_stream())
+                st.session_state.messages.append(AIMessage(content=reply))
+            except Exception as exc:
+                placeholder.error(f"Could not complete that turn: {exc}")
+
