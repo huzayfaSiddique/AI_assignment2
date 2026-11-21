@@ -29,7 +29,8 @@ mcp.tool(get_remaining_credit_hours)
 mcp.tool(save_report)
 
 if __name__ == "__main__":
-    host = os.getenv("HOST", "127.0.0.1")
+    default_host = "0.0.0.0" if os.getenv("PORT") else "127.0.0.1"
+    host = os.getenv("HOST", default_host)
     port = int(os.getenv("PORT", "8000"))
     print(f"Starting FastMCP server on http://{host}:{port}/mcp ...")
     mcp.run(transport="http", host=host, port=port)
